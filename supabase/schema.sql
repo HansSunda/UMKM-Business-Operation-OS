@@ -1,13 +1,17 @@
 -- ==============================================================================
--- UMKM Business Operations OS — Complete PostgreSQL Schema, RLS & Seed
+-- UMKM Business Operations OS — Complete PostgreSQL Schema, Functions, Views & RLS
 -- File: supabase/schema.sql
--- Run this directly in the Supabase SQL Editor
+-- 
+-- CARA PENGGUNAAN DI WEBSITE SUPABASE:
+-- 1. Buka dashboard proyek Anda di https://supabase.com/dashboard
+-- 2. Masuk ke menu "SQL Editor" di bilah navigasi kiri
+-- 3. Klik "New Query", tempel (paste) seluruh isi file ini, lalu klik "Run"
 -- ==============================================================================
 
 -- 1. Enable UUID Extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 2. Profiles Table
+-- 2. Profiles Table (Linked to auth.users)
 CREATE TABLE IF NOT EXISTS public.profiles (
     id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
     full_name TEXT NOT NULL,
@@ -17,7 +21,7 @@ CREATE TABLE IF NOT EXISTS public.profiles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 3. Businesses Table
+-- 3. Businesses Table (Tenants)
 CREATE TABLE IF NOT EXISTS public.businesses (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name TEXT NOT NULL,
@@ -34,7 +38,7 @@ CREATE TABLE IF NOT EXISTS public.businesses (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 4. Business Members Table
+-- 4. Business Members Table (Multi-tenant membership and RBAC)
 CREATE TABLE IF NOT EXISTS public.business_members (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -47,7 +51,7 @@ CREATE TABLE IF NOT EXISTS public.business_members (
 CREATE INDEX IF NOT EXISTS idx_business_members_user ON public.business_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_business_members_business ON public.business_members(business_id);
 
--- 5. Customers Table
+-- 5. Customers Table (Pelanggan)
 CREATE TABLE IF NOT EXISTS public.customers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -63,7 +67,7 @@ CREATE TABLE IF NOT EXISTS public.customers (
 CREATE INDEX IF NOT EXISTS idx_customers_business ON public.customers(business_id);
 CREATE INDEX IF NOT EXISTS idx_customers_name ON public.customers(business_id, name);
 
--- 6. Quotations Table
+-- 6. Quotations Table (Penawaran)
 CREATE TABLE IF NOT EXISTS public.quotations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -100,7 +104,7 @@ CREATE TABLE IF NOT EXISTS public.quotation_items (
 
 CREATE INDEX IF NOT EXISTS idx_quotation_items_quotation ON public.quotation_items(quotation_id);
 
--- 8. Projects Table
+-- 8. Projects Table (Proyek)
 CREATE TABLE IF NOT EXISTS public.projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -121,7 +125,7 @@ CREATE TABLE IF NOT EXISTS public.projects (
 CREATE INDEX IF NOT EXISTS idx_projects_business ON public.projects(business_id);
 CREATE INDEX IF NOT EXISTS idx_projects_customer ON public.projects(customer_id);
 
--- 9. Invoices Table
+-- 9. Invoices Table (Tagihan)
 CREATE TABLE IF NOT EXISTS public.invoices (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -160,7 +164,7 @@ CREATE TABLE IF NOT EXISTS public.invoice_items (
 
 CREATE INDEX IF NOT EXISTS idx_invoice_items_invoice ON public.invoice_items(invoice_id);
 
--- 11. Payments Table
+-- 11. Payments Table (Pembayaran)
 CREATE TABLE IF NOT EXISTS public.payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     business_id UUID NOT NULL REFERENCES public.businesses(id) ON DELETE CASCADE,
@@ -176,7 +180,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
 CREATE INDEX IF NOT EXISTS idx_payments_business ON public.payments(business_id);
 CREATE INDEX IF NOT EXISTS idx_payments_invoice ON public.payments(invoice_id);
 
--- 12. Helper Functions & Views
+-- 12. Helper Security Functions (SECURITY DEFINER)
 CREATE OR REPLACE FUNCTION public.get_user_business_ids(p_user_id UUID)
 RETURNS SETOF UUID AS $$
 BEGIN
@@ -193,6 +197,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER STABLE;
 
+-- 13. Smart Calculated Views
 CREATE OR REPLACE VIEW public.v_invoice_summaries AS
 SELECT 
     i.*,
@@ -232,3 +237,183 @@ LEFT JOIN (
     WHERE i.project_id IS NOT NULL AND i.status != 'cancelled'
     GROUP BY i.project_id
 ) pay ON proj.id = pay.project_id;
+
+-- 14. Enable Row Level Security (RLS) on all tables
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.businesses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.business_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.quotations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.quotation_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invoices ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.invoice_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
+
+-- 15. RLS Policies
+
+-- Profiles
+CREATE POLICY "Users can view their own profile or fellow members"
+ON public.profiles FOR SELECT TO authenticated
+USING (id = auth.uid() OR id IN (
+    SELECT bm.user_id FROM public.business_members bm WHERE bm.business_id IN (SELECT public.get_user_business_ids(auth.uid()))
+));
+
+CREATE POLICY "Users can update their own profile"
+ON public.profiles FOR UPDATE TO authenticated
+USING (id = auth.uid()) WITH CHECK (id = auth.uid());
+
+CREATE POLICY "Users can insert their own profile"
+ON public.profiles FOR INSERT TO authenticated
+WITH CHECK (id = auth.uid());
+
+-- Businesses
+CREATE POLICY "Users can view businesses they belong to"
+ON public.businesses FOR SELECT TO authenticated
+USING (id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Authenticated users can create a business"
+ON public.businesses FOR INSERT TO authenticated
+WITH CHECK (owner_id = auth.uid());
+
+CREATE POLICY "Owners and Admins can update business details"
+ON public.businesses FOR UPDATE TO authenticated
+USING (public.get_user_role(id, auth.uid()) IN ('owner', 'admin'))
+WITH CHECK (public.get_user_role(id, auth.uid()) IN ('owner', 'admin'));
+
+-- Business Members
+CREATE POLICY "Members can view other members in their business"
+ON public.business_members FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can manage members"
+ON public.business_members FOR INSERT TO authenticated
+WITH CHECK (user_id = auth.uid() OR public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+CREATE POLICY "Owners and Admins can update member roles"
+ON public.business_members FOR UPDATE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'))
+WITH CHECK (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+CREATE POLICY "Owners can remove members"
+ON public.business_members FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) = 'owner');
+
+-- Customers
+CREATE POLICY "Users can view customers of their business"
+ON public.customers FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can insert customers for their business"
+ON public.customers FOR INSERT TO authenticated
+WITH CHECK (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can update customers of their business"
+ON public.customers FOR UPDATE TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can delete customers"
+ON public.customers FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+-- Quotations
+CREATE POLICY "Users can view quotations of their business"
+ON public.quotations FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can create quotations for their business"
+ON public.quotations FOR INSERT TO authenticated
+WITH CHECK (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can update quotations of their business"
+ON public.quotations FOR UPDATE TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can delete quotations"
+ON public.quotations FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+-- Quotation Items
+CREATE POLICY "Users can view quotation items"
+ON public.quotation_items FOR SELECT TO authenticated
+USING (quotation_id IN (SELECT id FROM public.quotations WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can insert quotation items"
+ON public.quotation_items FOR INSERT TO authenticated
+WITH CHECK (quotation_id IN (SELECT id FROM public.quotations WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can update quotation items"
+ON public.quotation_items FOR UPDATE TO authenticated
+USING (quotation_id IN (SELECT id FROM public.quotations WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can delete quotation items"
+ON public.quotation_items FOR DELETE TO authenticated
+USING (quotation_id IN (SELECT id FROM public.quotations WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+-- Projects
+CREATE POLICY "Users can view projects of their business"
+ON public.projects FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can create projects for their business"
+ON public.projects FOR INSERT TO authenticated
+WITH CHECK (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can update projects of their business"
+ON public.projects FOR UPDATE TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can delete projects"
+ON public.projects FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+-- Invoices
+CREATE POLICY "Users can view invoices of their business"
+ON public.invoices FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can create invoices for their business"
+ON public.invoices FOR INSERT TO authenticated
+WITH CHECK (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can update invoices of their business"
+ON public.invoices FOR UPDATE TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can delete invoices"
+ON public.invoices FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+-- Invoice Items
+CREATE POLICY "Users can view invoice items"
+ON public.invoice_items FOR SELECT TO authenticated
+USING (invoice_id IN (SELECT id FROM public.invoices WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can insert invoice items"
+ON public.invoice_items FOR INSERT TO authenticated
+WITH CHECK (invoice_id IN (SELECT id FROM public.invoices WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can update invoice items"
+ON public.invoice_items FOR UPDATE TO authenticated
+USING (invoice_id IN (SELECT id FROM public.invoices WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+CREATE POLICY "Users can delete invoice items"
+ON public.invoice_items FOR DELETE TO authenticated
+USING (invoice_id IN (SELECT id FROM public.invoices WHERE business_id IN (SELECT public.get_user_business_ids(auth.uid()))));
+
+-- Payments
+CREATE POLICY "Users can view payments of their business"
+ON public.payments FOR SELECT TO authenticated
+USING (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Users can record payments for their business"
+ON public.payments FOR INSERT TO authenticated
+WITH CHECK (business_id IN (SELECT public.get_user_business_ids(auth.uid())));
+
+CREATE POLICY "Owners and Admins can update payment records"
+ON public.payments FOR UPDATE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
+
+CREATE POLICY "Owners and Admins can delete payment records"
+ON public.payments FOR DELETE TO authenticated
+USING (public.get_user_role(business_id, auth.uid()) IN ('owner', 'admin'));
